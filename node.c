@@ -1,226 +1,209 @@
 /*
- * node.c  –  Lab-machine worker
+ * node.c — Lab-machine worker (Machine B)
  *
- * Listens for connections from the load-balancer.
- * Each connection carries a 1-byte message type:
- *   MSG_QUERY_LOAD  → reply with uint32 active-job count
- *   MSG_RUN_CODE    → recv source string, compile & run, reply output string
+ * Compile:  gcc node.c common.c -o node -lpthread
+ * Run:      ./node          (uses DEFAULT_NODE_BASE_PORT = 9010)
+ *           ./node 9011     (optional: pass port as argument)
+ *
+ * Responsibilities:
+ *   1. Maintains a LOCAL SERVER that listens for connections from Machine A.
+ *   2. Responds to load queries (MSG_QUERY_LOAD) with its active-job count.
+ *   3. Receives a compiled binary (MSG_RUN_BINARY), executes it in a sandboxed
+ *      temp directory, and returns stdout+stderr to Machine A.
+ *
+ * Each incoming connection is handled in its own thread so multiple jobs
+ * can be accepted simultaneously (load is tracked atomically).
  */
 
+#define _GNU_SOURCE
 #include "common.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* ── load tracking ─────────────────────────────────────────────────── */
-static pthread_mutex_t g_load_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ── active-job counter (load tracking) ─────────────────────────────── */
+static pthread_mutex_t g_load_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t        g_active_jobs = 0;
 
-static void inc_jobs(void) {
-    pthread_mutex_lock(&g_load_mutex);
-    g_active_jobs++;
-    pthread_mutex_unlock(&g_load_mutex);
-}
+static void      inc_load(void) { pthread_mutex_lock(&g_load_mutex); g_active_jobs++;                        pthread_mutex_unlock(&g_load_mutex); }
+static void      dec_load(void) { pthread_mutex_lock(&g_load_mutex); if (g_active_jobs) g_active_jobs--;    pthread_mutex_unlock(&g_load_mutex); }
+static uint32_t  get_load(void) { uint32_t v; pthread_mutex_lock(&g_load_mutex); v = g_active_jobs; pthread_mutex_unlock(&g_load_mutex); return v; }
 
-static void dec_jobs(void) {
-    pthread_mutex_lock(&g_load_mutex);
-    if (g_active_jobs > 0) g_active_jobs--;
-    pthread_mutex_unlock(&g_load_mutex);
-}
-
-static uint32_t get_jobs(void) {
-    uint32_t v;
-    pthread_mutex_lock(&g_load_mutex);
-    v = g_active_jobs;
-    pthread_mutex_unlock(&g_load_mutex);
-    return v;
-}
-
-/* ── helpers ────────────────────────────────────────────────────────── */
-static int create_listener(int port) {
-    int fd  = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    struct sockaddr_in addr;
-
-    if (fd < 0) { perror("socket"); exit(1); }
-
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(fd); exit(1);
+/* ── write_all (for writing binary data to a file descriptor) ────────── */
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p    = (const char *)buf;
+    size_t      sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n <= 0) return -1;
+        sent += (size_t)n;
     }
-    if (listen(fd, 64) < 0) {
-        perror("listen"); close(fd); exit(1);
-    }
-    return fd;
+    return 0;
 }
 
-static char *read_text_file(const char *path, uint32_t *out_len) {
-    FILE *fp     = fopen(path, "rb");
-    char *buffer = NULL;
-    long  size   = 0;
-
+/* ── read output file into a malloc'd string ─────────────────────────── */
+static char *read_output_file(const char *path, uint32_t *out_len) {
+    FILE *fp = fopen(path, "rb");
     if (!fp) {
-        buffer   = strdup("Failed to open result file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+        const char *msg = "(node: could not open output file)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
-
     fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
+    long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    if (size < 0) {
+    if (sz <= 0) {
         fclose(fp);
-        buffer   = strdup("Failed to read result file size.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+        const char *msg = "(program produced no output)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
 
-    buffer = (char *)malloc((size_t)size + 1);
-    if (!buffer) {
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
         fclose(fp);
-        buffer   = strdup("Memory allocation failed.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+        const char *msg = "(node: malloc failed reading output)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
-
-    if (size > 0) { size_t nr = fread(buffer, 1, (size_t)size, fp); (void)nr; }
-    buffer[size] = '\0';
+    size_t nr = fread(buf, 1, (size_t)sz, fp); (void)nr;
+    buf[sz] = '\0';
     fclose(fp);
-
-    if (size == 0) {
-        free(buffer);
-        buffer = strdup("Program finished with no output.\n");
-        size   = (long)strlen(buffer);
-    }
-
-    *out_len = (uint32_t)size;
-    return buffer;
+    *out_len = (uint32_t)sz;
+    return buf;
 }
 
-/* Compile source_code in a temp file, run it, return stdout+stderr */
-static char *run_code(const char *source_code, uint32_t *out_len) {
-    char  source_tpl[] = "/tmp/lab_node_XXXXXX.c";
-    char  output_tpl[] = "/tmp/lab_out_XXXXXX.txt";
-    char  binary_path[PATH_MAX];
-    int   source_fd, output_fd;
-    pid_t pid;
-    int   status;
-    char *buffer;
-
-    source_fd = mkstemps(source_tpl, 2);   /* suffix ".c" → len 2 */
-    if (source_fd < 0) {
-        buffer   = strdup("Failed to create temp source file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+/*
+ * run_binary()
+ *
+ * Receives the raw bytes of an already-compiled ELF binary,
+ * writes them to a temp file, chmod 0700, forks, executes,
+ * captures stdout+stderr, and returns the output string.
+ *
+ * The server compiles on Machine A; this node just RUNS the binary.
+ */
+static char *run_binary(const char *binary, uint32_t bin_len, uint32_t *out_len) {
+    /* Temp file for the binary */
+    char bin_tpl[] = "/tmp/lab_node_bin_XXXXXX";
+    int  bin_fd    = mkstemp(bin_tpl);
+    if (bin_fd < 0) {
+        const char *msg = "(node: mkstemp failed for binary)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
-    if (write(source_fd, source_code, strlen(source_code)) < 0) {
-        close(source_fd); unlink(source_tpl);
-        buffer   = strdup("Failed to write source file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+    if (write_all(bin_fd, binary, (size_t)bin_len) < 0) {
+        close(bin_fd); unlink(bin_tpl);
+        const char *msg = "(node: failed to write binary to temp file)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
-    close(source_fd);
+    close(bin_fd);
+    chmod(bin_tpl, 0700);   /* make executable */
 
-    snprintf(binary_path, sizeof(binary_path), "%s.bin", source_tpl);
-
-    output_fd = mkstemps(output_tpl, 4);   /* suffix ".txt" → len 4 */
-    if (output_fd < 0) {
-        unlink(source_tpl);
-        buffer   = strdup("Failed to create temp output file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+    /* Temp file to capture stdout + stderr */
+    char out_tpl[] = "/tmp/lab_node_out_XXXXXX.txt";
+    int  out_fd    = mkstemps(out_tpl, 4);
+    if (out_fd < 0) {
+        unlink(bin_tpl);
+        const char *msg = "(node: mkstemps failed for output capture)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
-    close(output_fd);
+    close(out_fd);
 
-    /* ── compile ── */
-    pid = fork();
+    /* Fork and execute */
+    pid_t pid = fork();
     if (pid == 0) {
-        int ofd = open(output_tpl, O_WRONLY | O_TRUNC);
-        if (ofd >= 0) { dup2(ofd, STDOUT_FILENO); dup2(ofd, STDERR_FILENO); close(ofd); }
-        execlp("gcc", "gcc", source_tpl, "-O2", "-o", binary_path, NULL);
+        /* Child: redirect stdout & stderr into output file, then exec */
+        int ofd = open(out_tpl, O_WRONLY | O_TRUNC);
+        if (ofd >= 0) {
+            dup2(ofd, STDOUT_FILENO);
+            dup2(ofd, STDERR_FILENO);
+            close(ofd);
+        }
+        execl(bin_tpl, bin_tpl, NULL);
         _exit(1);
     }
-    waitpid(pid, &status, 0);
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        /* Compilation error – return compiler output */
-        buffer = read_text_file(output_tpl, out_len);
-        unlink(source_tpl);
-        unlink(output_tpl);
-        return buffer;
+    if (pid < 0) {
+        unlink(bin_tpl);
+        unlink(out_tpl);
+        const char *msg = "(node: fork() failed)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
 
-    /* ── run ── */
-    pid = fork();
-    if (pid == 0) {
-        int ofd = open(output_tpl, O_WRONLY | O_TRUNC);
-        if (ofd >= 0) { dup2(ofd, STDOUT_FILENO); dup2(ofd, STDERR_FILENO); close(ofd); }
-        execl(binary_path, binary_path, NULL);
-        _exit(1);
-    }
+    int status = 0;
     waitpid(pid, &status, 0);
 
-    buffer = read_text_file(output_tpl, out_len);
+    char *result = read_output_file(out_tpl, out_len);
 
-    unlink(source_tpl);
-    unlink(binary_path);
-    unlink(output_tpl);
-    return buffer;
+    unlink(bin_tpl);
+    unlink(out_tpl);
+    return result;
 }
 
-/* ── per-connection thread ─────────────────────────────────────────── */
+/* ── per-connection handler thread ──────────────────────────────────── */
 static void *handle_connection(void *arg) {
     int      fd  = *(int *)arg;
-    uint32_t msg = 0;
     free(arg);
 
-    if (recv_u32(fd, &msg) < 0) { close(fd); return NULL; }
+    uint32_t msg_type = 0;
+    if (recv_u32(fd, &msg_type) < 0) {
+        close(fd);
+        return NULL;
+    }
 
-    if (msg == MSG_QUERY_LOAD) {
-        /* Reply with current active-job count */
-        send_u32(fd, get_jobs());
-
-    } else if (msg == MSG_RUN_CODE) {
-        uint32_t code_len  = 0;
-        uint32_t out_len   = 0;
-        char    *source    = NULL;
-        char    *output    = NULL;
-
-        source = recv_string(fd, &code_len);
-        if (!source) { close(fd); return NULL; }
-
-        inc_jobs();
-        printf("[node] Running job (%u active)\n", get_jobs());
+    /* ── MSG_QUERY_LOAD ── */
+    if (msg_type == MSG_QUERY_LOAD) {
+        uint32_t load = get_load();
+        send_u32(fd, load);
+        printf("[node] Load query answered: %u active job(s)\n", load);
         fflush(stdout);
 
-        output = run_code(source, &out_len);
-        send_string(fd, output, out_len);
+    /* ── MSG_RUN_BINARY ── */
+    } else if (msg_type == MSG_RUN_BINARY) {
+        uint32_t  bin_len = 0;
+        char     *binary  = recv_string(fd, &bin_len);
+        if (!binary) {
+            fprintf(stderr, "[node] Failed to receive binary payload.\n");
+            close(fd);
+            return NULL;
+        }
 
-        dec_jobs();
-        printf("[node] Job done  (%u active)\n", get_jobs());
+        inc_load();
+        printf("[node] Received binary (%u bytes). Running... (load now: %u)\n",
+               bin_len, get_load());
         fflush(stdout);
 
-        free(source);
+        uint32_t out_len = 0;
+        char    *output  = run_binary(binary, bin_len, &out_len);
+
+        if (send_string(fd, output, out_len) < 0)
+            fprintf(stderr, "[node] Failed to send output back to server.\n");
+
+        dec_load();
+        printf("[node] Job complete. Output sent (%u bytes). (load now: %u)\n",
+               out_len, get_load());
+        fflush(stdout);
+
+        free(binary);
         free(output);
+
     } else {
-        fprintf(stderr, "[node] Unknown message type %u\n", msg);
+        fprintf(stderr, "[node] Unknown message type: %u\n", msg_type);
     }
 
     close(fd);
@@ -228,34 +211,67 @@ static void *handle_connection(void *arg) {
 }
 
 /* ── main ───────────────────────────────────────────────────────────── */
-int main(void) {
-    int  port;
-    char input[32];
-    int  listener;
+int main(int argc, char *argv[]) {
+    int port = DEFAULT_NODE_BASE_PORT;
 
-    printf("Enter node port [%d]: ", DEFAULT_NODE_BASE_PORT);
-    fflush(stdout);
-    if (!fgets(input, sizeof(input), stdin)) { port = DEFAULT_NODE_BASE_PORT; }
-    else {
-        input[strcspn(input, "\n")] = '\0';
-        port = (input[0] != '\0') ? atoi(input) : DEFAULT_NODE_BASE_PORT;
+    /* Allow port as command-line argument */
+    if (argc >= 2) {
+        port = atoi(argv[1]);
+        if (port <= 0) port = DEFAULT_NODE_BASE_PORT;
+    } else {
+        /* Interactive prompt as fallback */
+        char input[32];
+        printf("Enter node listen port [%d]: ", DEFAULT_NODE_BASE_PORT);
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            input[strcspn(input, "\n")] = '\0';
+            if (input[0] != '\0') port = atoi(input);
+        }
     }
 
-    listener = create_listener(port);
+    /* Create the local listener socket */
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) { perror("socket"); return 1; }
+
+    int opt = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(listener); return 1;
+    }
+    if (listen(listener, 64) < 0) {
+        perror("listen"); close(listener); return 1;
+    }
+
+    printf("╔══════════════════════════════════════════╗\n");
+    printf("║         NODE WORKER — READY               ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
     printf("[node] Listening on port %d\n", port);
+    printf("[node] Waiting for jobs from server (Machine A)...\n\n");
     fflush(stdout);
 
     while (1) {
-        int       *cfd = (int *)malloc(sizeof(int));
-        pthread_t  tid;
+        int *cfd = (int *)malloc(sizeof(int));
         if (!cfd) continue;
 
         *cfd = accept(listener, NULL, NULL);
         if (*cfd < 0) { free(cfd); continue; }
 
-        pthread_create(&tid, NULL, handle_connection, cfd);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_connection, cfd) != 0) {
+            close(*cfd);
+            free(cfd);
+            continue;
+        }
         pthread_detach(tid);
     }
 
+    close(listener);
     return 0;
 }
