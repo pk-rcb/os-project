@@ -113,7 +113,7 @@ static void refresh_all_loads(void) {
 /* ── compile a .c file locally, return binary in malloc'd buffer ─────── */
 static char *compile_local(const char *src_path, uint32_t *out_len) {
     /* Temp file for the output binary */
-    char bin_tpl[] = "/tmp/lab_server_bin_XXXXXX";
+    char bin_tpl[] = "./lab_server_bin_XXXXXX";
     int  bin_fd    = mkstemp(bin_tpl);
     if (bin_fd < 0) {
         fprintf(stderr, "[server] mkstemp for binary failed: %s\n", strerror(errno));
@@ -122,7 +122,7 @@ static char *compile_local(const char *src_path, uint32_t *out_len) {
     close(bin_fd);   /* gcc will (re-)create/overwrite it */
 
     /* Temp file to capture compiler output (errors/warnings) */
-    char err_tpl[] = "/tmp/lab_server_err_XXXXXX.txt";
+    char err_tpl[] = "./lab_server_err_XXXXXX.txt";
     int  err_fd    = mkstemps(err_tpl, 4);
     if (err_fd < 0) {
         unlink(bin_tpl);
@@ -244,8 +244,13 @@ static int list_c_files(char files[][256], int max) {
     while ((e = readdir(d)) != NULL && count < max) {
         size_t n = strlen(e->d_name);
         if (n > 2 && strcmp(e->d_name + n - 2, ".c") == 0) {
-            strncpy(files[count], e->d_name, 255);
-            files[count][255] = '\0';
+            if (strcmp(e->d_name, "server.c") == 0 ||
+                strcmp(e->d_name, "node.c")   == 0 ||
+                strcmp(e->d_name, "common.c") == 0 ||
+                strncmp(e->d_name, "client", 6) == 0) {
+                continue;
+            }
+            snprintf(files[count], 256, "%s", e->d_name);
             count++;
         }
     }
@@ -292,8 +297,7 @@ int main(void) {
         if (strcmp(input, "done") == 0 || input[0] == '\0') break;
 
         NodeInfo *n = &g_nodes[g_node_count];
-        strncpy(n->ip, input, INET_ADDRSTRLEN - 1);
-        n->ip[INET_ADDRSTRLEN - 1] = '\0';
+        snprintf(n->ip, INET_ADDRSTRLEN, "%.*s", INET_ADDRSTRLEN - 1, input);
 
         printf("Node %d — Port [%d]: ", g_node_count + 1, DEFAULT_NODE_BASE_PORT);
         fflush(stdout);
@@ -348,7 +352,7 @@ int main(void) {
             printf("New node IP: "); fflush(stdout);
             if (!fgets(input, sizeof(input), stdin)) break;
             input[strcspn(input, "\n")] = '\0';
-            strncpy(n->ip, input, INET_ADDRSTRLEN - 1);
+            snprintf(n->ip, INET_ADDRSTRLEN, "%.*s", INET_ADDRSTRLEN - 1, input);
 
             printf("New node port [%d]: ", DEFAULT_NODE_BASE_PORT); fflush(stdout);
             if (!fgets(input, sizeof(input), stdin)) break;

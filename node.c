@@ -96,7 +96,7 @@ static char *read_output_file(const char *path, uint32_t *out_len) {
  */
 static char *run_binary(const char *binary, uint32_t bin_len, uint32_t *out_len) {
     /* Temp file for the binary */
-    char bin_tpl[] = "/tmp/lab_node_bin_XXXXXX";
+    char bin_tpl[] = "./lab_node_bin_XXXXXX";
     int  bin_fd    = mkstemp(bin_tpl);
     if (bin_fd < 0) {
         const char *msg = "(node: mkstemp failed for binary)\n";
@@ -113,7 +113,7 @@ static char *run_binary(const char *binary, uint32_t bin_len, uint32_t *out_len)
     chmod(bin_tpl, 0700);   /* make executable */
 
     /* Temp file to capture stdout + stderr */
-    char out_tpl[] = "/tmp/lab_node_out_XXXXXX.txt";
+    char out_tpl[] = "./lab_node_out_XXXXXX.txt";
     int  out_fd    = mkstemps(out_tpl, 4);
     if (out_fd < 0) {
         unlink(bin_tpl);
